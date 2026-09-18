@@ -7,7 +7,7 @@ Entry point is 'result_from_summary'.
 from __future__ import annotations
 
 import json
-import logging
+import os
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
@@ -26,8 +26,6 @@ from execution.types import ExecutionResult, FailureContext, TrialSnapshot
 from models.problem import ProblemTestCategory, ProblemTestResult, ProblemTestResultStatus
 from ridges_harbor._stdlib_contract import AGENT_LOG_FILENAMES, HARBOR_RUNNER_ERROR_FILENAME
 from ridges_harbor.runner import HarborRunSummary
-
-logger = logging.getLogger(__name__)
 
 
 class VerifierTestResultsPayload(BaseModel):
@@ -57,15 +55,8 @@ def result_from_summary(summary: HarborRunSummary) -> ExecutionResult:
 
     trial_exception = summary.trial_result.exception_info
     if trial_exception is not None:
-        if _agent_timed_out_then_verifier_produced_reward(summary, trial_paths=trial_paths):
-            try:
-                return parse_execution_artifacts(summary, trial_paths=trial_paths, context=context)
-            except Exception as exception:
-                logger.warning(
-                    f"Partial-credit scoring of a timed-out trial failed; "
-                    f"falling back to the recorded trial exception: {exception}",
-                    exc_info=True,
-                )
+        if _agent_timed_out_then_verifier_produced_reward(summary):
+            return parse_execution_artifacts(summary, trial_paths=trial_paths, context=context)
 
         failure = classify_trial_failure(
             trial_result=summary.trial_result,
@@ -82,18 +73,12 @@ def result_from_summary(summary: HarborRunSummary) -> ExecutionResult:
     return parse_execution_artifacts(summary, trial_paths=trial_paths, context=context)
 
 
-def _agent_timed_out_then_verifier_produced_reward(summary: HarborRunSummary, *, trial_paths: TrialPaths) -> bool:
+def _agent_timed_out_then_verifier_produced_reward(summary: HarborRunSummary) -> bool:
     """True when Harbor recorded an agent timeout, then completed verification
-    with a usable numeric reward on a patch the agent managed to export.
-
-    Without a patch artifact there is nothing to score: the timeout killed the
-    runtime before it exported patch.diff, so the timeout stays the failure.
+    with a usable numeric reward.
     """
     exception_type = (summary.trial_result.exception_info.exception_type or "").strip()
     if exception_type not in AGENT_TIMEOUT_EXCEPTION_NAMES:
-        return False
-
-    if not read_text(trial_paths.agent_dir / "patch.diff"):
         return False
 
     verifier_result = summary.trial_result.verifier_result
@@ -258,9 +243,10 @@ def parse_execution_artifacts(
 
     cost_usd = _read_proxy_cost(summary.job_dir) if summary.job_dir else None
 
-    from validator.config import RIDGES_ENVIRONMENT_TYPE
-
-    backend_label = "harbor-k8s" if RIDGES_ENVIRONMENT_TYPE == "kubernetes" else "harbor"
+    # Read the env var directly rather than importing validator.config: that module
+    # pulls in bittensor_wallet and hard-fails without a full validator .env, which
+    # miners running `ridges miner run-local` do not have.
+    backend_label = "harbor-k8s" if os.getenv("RIDGES_ENVIRONMENT_TYPE") == "kubernetes" else "harbor"
 
     return ExecutionResult(
         backend=backend_label,
