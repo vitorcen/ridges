@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import shutil
 import tarfile
 import time
@@ -24,8 +25,42 @@ from ridges_harbor.shared import DEFAULT_RESULTS_DIR, HarborRunSummary
 _ARCHIVE_SUFFIXES = (".tar.gz", ".tgz")
 _IGNORED_TOP_LEVEL_NAMES = {"__MACOSX", ".DS_Store"}
 _TASK_STAGING_DIRNAME = "_task_staging"
+# A host directory of pre-built wheels, bind-mounted read-only into every cell
+# so `LocalMinerAgent`'s baseline install is a disk copy instead of a PyPI
+# download per cell.  Opt-in by env var and silently inert when the directory
+# does not exist, because this is a local-throughput fix and must not be able
+# to change what a cell reports.  Built by `bench/ops/wheelhouse.py`.
+_WHEELHOUSE_ENV = "RIDGES_LOCAL_WHEELHOUSE"
+_WHEELHOUSE_TARGET = "/wheels"
 
 logger = logging.getLogger(__name__)
+
+
+def _wheelhouse_mounts() -> list[dict] | None:
+    """Bind mount for the local wheelhouse, or None when there is none.
+
+    Refuses rather than mounts when the directory is named but missing: a
+    silently absent wheelhouse is a cell that quietly goes back to downloading
+    from PyPI, which is exactly the failure this is meant to end, and it would
+    only show up as an unexplained slowdown.
+    """
+    raw = os.getenv(_WHEELHOUSE_ENV)
+    if not raw:
+        return None
+    source = Path(raw).expanduser().resolve()
+    if not (source / "requirements.lock").is_file():
+        raise RuntimeError(
+            f"{_WHEELHOUSE_ENV}={raw} has no requirements.lock. "
+            "Build it with bench/ops/wheelhouse.py --build, or unset the variable."
+        )
+    return [
+        {
+            "type": "bind",
+            "source": str(source),
+            "target": _WHEELHOUSE_TARGET,
+            "read_only": True,
+        }
+    ]
 
 
 def _normalize_endpoint_url(url: str, *, label: str) -> str:
@@ -216,6 +251,41 @@ def _prepare_local_task_dir(
     return _extract_archive_to_cache(task_path, staging_root=task_staging_cache_dir(results_dir))
 
 
+def verifier_applies_patch(task_dir: Path) -> bool:
+    """Whether this pack's own verifier applies the patch, so the agent must not.
+
+    The set28 packs declare `[verifier] environment_mode = "separate"` and their
+    `tests/test.sh` copies `/logs/agent/patch.diff` to `graded.patch` and runs
+    `git apply` on /app itself.  Upstream honours the declaration by building a
+    second container for the verifier, so that apply lands on a clean tree.
+    harbor 0.3.0 has no notion of `environment_mode` at all -- it runs the
+    verifier inside the agent's own container -- so the agent's apply and the
+    verifier's apply hit the same /app, the verifier's `git apply --check`
+    fails, and test.sh exits before writing anything but the 0 it seeds.  Every
+    set28 cell read `solved 0` for that reason and no other.
+
+    Read off the declaration rather than off test.sh: the declaration is the
+    pack's contract, one line, and it is what upstream keys on.  It is also 1:1
+    with the packs whose test.sh applies -- 15 of 15, checked -- so the two
+    readings cannot disagree without the pack being wrong about itself.
+
+    A pack that declares nothing (every set26/27 pack) comes back False and is
+    run exactly as before.
+    """
+    import tomllib
+
+    config_path = task_dir / "task.toml"
+    try:
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # An unreadable task.toml is Harbor's error to raise, not ours: saying
+        # "no separate verifier" here keeps this function from being the place
+        # a broken pack first shows up, wearing the wrong error.
+        return False
+    mode = config.get("verifier", {}).get("environment_mode")
+    return isinstance(mode, str) and mode.strip().lower() == "separate"
+
+
 async def _verify_task_digest(task_dir: Path, *, task_name: str, task_digest: str) -> None:
     """Verify a local task directory matches the expected content digest."""
     actual_digest = await asyncio.to_thread(compute_task_digest, task_dir)
@@ -258,7 +328,7 @@ async def run_local_task(
     from harbor.environments.factory import EnvironmentFactory
     from harbor.job import Job
     from harbor.models.job.config import JobConfig, RetryConfig
-    from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig
+    from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig, VerifierConfig
 
     resolved_task_path = Path(task_path).expanduser().resolve()
     resolved_agent_path = Path(agent_path).expanduser().resolve()
@@ -284,6 +354,8 @@ async def run_local_task(
     resolved_job_name = job_name or f"{effective_task_name}__{uuid4().hex[:8]}"
     job_dir = resolved_results_dir / resolved_job_name
 
+    separate = verifier_applies_patch(effective_task_dir)
+
     config = JobConfig(
         job_name=resolved_job_name,
         jobs_dir=resolved_results_dir,
@@ -292,13 +364,22 @@ async def run_local_task(
         n_concurrent_trials=1,
         quiet=True,
         retry=RetryConfig(max_retries=0),
-        environment=EnvironmentConfig(env={}),
+        environment=EnvironmentConfig(env={}, mounts_json=_wheelhouse_mounts()),
+        # Harbor's verifier stage runs `test.sh` inside the agent's container,
+        # which for these packs is the wrong container: it has neither /tests
+        # nor the `/opt/task` manifest the honesty gates read, and its sidecars
+        # hold the agent-visible passwords rather than the grader's.  It is
+        # switched off and the pack's own verifier environment is built below.
+        verifier=VerifierConfig(disable=separate),
         tasks=[TaskConfig(path=effective_task_dir)],
         agents=[
             AgentConfig(
                 import_path="miners.local_agent:LocalMinerAgent",
                 override_timeout_sec=effective_timeout,
-                kwargs={"agent_path": str(resolved_agent_path)},
+                kwargs={
+                    "agent_path": str(resolved_agent_path),
+                    "verifier_applies_patch": separate,
+                },
                 env=_local_agent_env(
                     evaluation_run_id=effective_evaluation_run_id,
                     inference=normalized_inference,
@@ -307,6 +388,18 @@ async def run_local_task(
             )
         ],
     )
+
+    # Harbor's own extension point for "start the containers differently".  It
+    # is honoured here rather than hard-coded so the substitute class can live
+    # in the harness that knows why it is needed -- the caller sets
+    # BENCH_ENV_IMPORT_PATH and puts the module on PYTHONPATH.  What it is used
+    # for on the eval box is pinning every container away from a core that
+    # corrupts what runs on it (bench/ops/fenced_docker.py); nothing about that
+    # belongs in this file.  Unset is the local default and leaves Harbor's own
+    # DockerEnvironment in place.
+    _env_import_path = (os.getenv("BENCH_ENV_IMPORT_PATH") or "").strip()
+    if _env_import_path:
+        config.environment.import_path = _env_import_path
 
     try:
         EnvironmentFactory.run_preflight(
@@ -333,6 +426,23 @@ async def run_local_task(
 
     trial_result = job_result.trial_results[0]
     trial_dir = job.job_dir / trial_result.trial_name
+
+    if separate:
+        # After the agent, not instead of it: the patch being graded is the one
+        # the agent left at /logs/agent/patch.diff, and the tree it is applied
+        # to is a container Harbor never gave the agent.
+        from harbor.models.verifier.result import VerifierResult
+
+        from ridges_harbor.separate_verifier import grade_with_separate_verifier
+
+        reward = await grade_with_separate_verifier(
+            task_dir=effective_task_dir,
+            trial_dir=trial_dir,
+            trial_name=trial_result.trial_name,
+        )
+        if reward is not None:
+            trial_result.verifier_result = VerifierResult(rewards={"reward": reward})
+
     return HarborRunSummary(
         trial_result=trial_result,
         task_name=effective_task_name,
