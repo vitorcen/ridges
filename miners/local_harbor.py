@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import shutil
 import tarfile
 import time
@@ -25,8 +26,56 @@ from ridges_harbor.shared import DEFAULT_RESULTS_DIR, HarborRunSummary
 _ARCHIVE_SUFFIXES = (".tar.gz", ".tgz")
 _IGNORED_TOP_LEVEL_NAMES = {"__MACOSX", ".DS_Store"}
 _TASK_STAGING_DIRNAME = "_task_staging"
+# A host directory of pre-built wheels, bind-mounted read-only into every cell
+# so `LocalMinerAgent`'s baseline install is a disk copy instead of a PyPI
+# download per cell.  Opt-in by env var and silently inert when the directory
+# does not exist, because this is a local-throughput fix and must not be able
+# to change what a cell reports.  Built by `bench/ops/wheelhouse.py`.
+_WHEELHOUSE_ENV = "RIDGES_LOCAL_WHEELHOUSE"
+_WHEELHOUSE_TARGET = "/wheels"
 
 logger = logging.getLogger(__name__)
+
+
+def _wheelhouse_mounts() -> list[dict] | None:
+    """Bind mount for the local wheelhouse, or None when there is none.
+
+    Refuses rather than mounts when the directory is named but missing: a
+    silently absent wheelhouse is a cell that quietly goes back to downloading
+    from PyPI, which is exactly the failure this is meant to end, and it would
+    only show up as an unexplained slowdown.
+    """
+    raw = os.getenv(_WHEELHOUSE_ENV)
+    if not raw:
+        return None
+    source = Path(raw).expanduser().resolve()
+    if not (source / "requirements.lock").is_file():
+        raise RuntimeError(
+            f"{_WHEELHOUSE_ENV}={raw} has no requirements.lock. "
+            "Build it with bench/ops/wheelhouse.py --build, or unset the variable."
+        )
+    return [
+        {
+            "type": "bind",
+            "source": str(source),
+            "target": _WHEELHOUSE_TARGET,
+            "read_only": True,
+        }
+    ]
+
+
+def _wheelhouse_kwargs() -> dict:
+    """`{"mounts": [...]}` when a wheelhouse is configured, `{}` when not.
+
+    Passed as keywords rather than always naming `mounts=` so that a cell
+    launched without a wheelhouse builds the same EnvironmentConfig upstream
+    builds, argument for argument.  That keeps this a local-throughput fix
+    rather than a change to the config every run is made from -- and it is what
+    upstream's own tests construct, so they stay green against the real class
+    and against their stand-in for it.
+    """
+    mounts = _wheelhouse_mounts()
+    return {"mounts": mounts} if mounts else {}
 
 
 def _positive_timeout(value: float | None) -> float | None:
@@ -325,7 +374,7 @@ async def run_local_task(
         n_concurrent_trials=1,
         quiet=True,
         retry=RetryConfig(max_retries=0),
-        environment=EnvironmentConfig(env={}),
+        environment=EnvironmentConfig(env={}, **_wheelhouse_kwargs()),
         verifier=VerifierConfig(import_path="ridges_harbor.verifier:RidgesVerifier"),
         artifacts=[],
         tasks=[TaskConfig(path=effective_task_dir)],
