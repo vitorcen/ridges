@@ -58,6 +58,7 @@ class RidgesMinerAgent(BaseInstalledAgent):
         extra_env: dict[str, str] | None = None,
         workdir: str | None = None,
         runtime_dir: str = "/installed-agent",
+        verifier_applies_patch: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -73,6 +74,18 @@ class RidgesMinerAgent(BaseInstalledAgent):
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.agent_path = Path(agent_path).expanduser().resolve()
         self.workdir = workdir
+        # Separate-verifier packs grade a CLEAN workdir: their own test.sh does
+        # `git apply /logs/verifier/graded.patch` in /app.  Upstream gives that
+        # verifier its own container, so the agent's applied copy is thrown
+        # away; harbor 0.3.0 has no `environment_mode` and reuses the agent's
+        # container, so the same patch is applied twice to the same tree and
+        # the verifier's own `git apply --check` fails -- every such cell
+        # scored 0 with `patch does not apply`, whatever the agent wrote.
+        # Leaving the apply to the verifier restores single-apply semantics
+        # without pretending the runner has two containers.  Off by default:
+        # set26/27 packs declare no mode and their test.sh does not apply, so
+        # for them the agent's apply is still the only one.
+        self.verifier_applies_patch = bool(verifier_applies_patch)
         self.runtime_dir = runtime_dir.rstrip("/")
         self.runtime_script_path = Path(__file__).with_name(RUNTIME_FILENAME)
         self.stdlib_contract_path = Path(__file__).with_name(STDLIB_CONTRACT_FILENAME)
@@ -270,7 +283,9 @@ class RidgesMinerAgent(BaseInstalledAgent):
 
         Called once per trial by Harbor after 'install()'. Uploads the
         instruction, executes the runtime with the canonical transcript captured to
-        'runtime.log', then runs 'git apply --check' followed by 'git apply'.
+        'runtime.log', then runs 'git apply --check' followed by 'git apply' --
+        the second one only when the verifier is not going to apply it itself
+        (see 'verifier_applies_patch').
 
         Raises MinerRuntimeError, MinerInvalidPatchError, or MinerPatchApplyError
         so Harbor's outer except clause catches them and skips the verifier.
@@ -312,6 +327,16 @@ class RidgesMinerAgent(BaseInstalledAgent):
                 error_summary="Miner returned an invalid patch",
                 error_type=MinerInvalidPatchError,
             )
+
+            if self.verifier_applies_patch:
+                # The check above already proved the patch applies to this
+                # tree; the verifier is the one that will spend it.
+                self._write_log(
+                    PATCH_APPLY_LOG_FILENAME,
+                    "skipped: the task declares a separate verifier environment, "
+                    "so its test.sh applies the patch to a clean workdir\n",
+                )
+                return
 
             patch_apply_command = f"git apply {shlex.quote(self._env_patch_path)}"
             await self._exec_with_log(
