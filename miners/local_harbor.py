@@ -395,6 +395,18 @@ async def run_local_task(
         ],
     )
 
+    # Harbor's own extension point for "start the containers differently".  It
+    # is honoured here rather than hard-coded so the substitute class can live
+    # in the harness that knows why it is needed -- the caller sets
+    # BENCH_ENV_IMPORT_PATH and puts the module on PYTHONPATH.  What it is used
+    # for on the eval box is pinning every container away from a core that
+    # corrupts what runs on it (bench/ops/fenced_docker.py); nothing about that
+    # belongs in this file.  Unset is the local default and leaves Harbor's own
+    # DockerEnvironment in place.
+    _env_import_path = (os.getenv("BENCH_ENV_IMPORT_PATH") or "").strip()
+    if _env_import_path:
+        config.environment.import_path = _env_import_path
+
     try:
         EnvironmentFactory.run_preflight(
             type=config.environment.type,
